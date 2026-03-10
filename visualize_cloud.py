@@ -1,212 +1,480 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import blosc    
+import blosc
 import numpy as np
 import open3d as o3d
-
-import pickle
 import torch
-# import pytorch3d.ops as torch3d_ops
-# import torchvision
-from termcolor import cprint
-import re
-import time
-import socket
+import pytorch_kinematics as pk
+import trimesh as tm
+import os
 
 
-BLOSC_PATH = "dataset/demo0010.blosc"
+ARM_AND_GRIPPER_DOF = 8
+FINGER_OPEN_ANGLE = 0.91
 
-# ===============================
-# 1️⃣ 读取 blosc
-# ===============================
-def unpack_one(raw, offset):
-    nbytes, cbytes, blocksize = blosc.get_cbuffer_sizes(raw[offset:])
-    buf = raw[offset: offset + cbytes]
-    arr = blosc.unpack_array(buf)
-    return arr, offset + cbytes
 
-def load_blosc_file(path):
-    with open(path, "rb") as f:
-        raw = f.read()
+#外参待修改
+RIGHT_CAM_EXTRINSIC = np.array([
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+], dtype=np.float32)
 
-    offset = 0
-    obs, offset = unpack_one(raw, offset)
-    action, offset = unpack_one(raw, offset)
-    timestamps, offset = unpack_one(raw, offset)
 
-    return obs
 
-obs = load_blosc_file(BLOSC_PATH)
-num_frames = len(obs)
-print("Total frames:", num_frames)
+# Gripper Model
 
-# ===============================
-# 2️⃣ 相机参数 (640×480 原始参数)
-# ===============================
-fx = 393.23
-fy = 393.23
-cx = 317.85
-cy = 243.23
-scale = 0.001
+class GripperModel:
 
-# ===============================
-# 3️⃣ depth → cloud
-# ===============================
-# WORK_SPACE = [
-#     [-0.6, 1.3],   # X 
-#     [-0.5, 0.5],   # Y
-#     [0.2, 1.8]     # Z
-# ]
-WORK_SPACE = [
-    [-0.6, 1.3],   # X 
-    [-0.15, 0.5],   # Y
-    [0.2, 1.8]     # Z
+    def __init__(self, urdf_path, mesh_root, gripper_links,
+                 device="cuda", sample_points=512):
+
+        self.device = device
+        self.gripper_links = gripper_links
+        self.sample_points = sample_points
+
+        with open(urdf_path, 'rb') as f:
+            urdf_bytes = f.read()
+
+        self.robot = pk.build_chain_from_urdf(urdf_bytes).to(
+            dtype=torch.float32,
+            device=device
+        )
+
+        print("Robot joints:", self.robot.n_joints)
+        self.joint_names = self.robot.get_joint_parameter_names()
+
+        self.link_points = {}
+
+        for link in gripper_links:
+
+            stl = os.path.join(mesh_root, f"{link}.STL")
+
+            mesh = tm.load(stl, force="mesh")
+
+            pts = mesh.sample(sample_points)
+
+            self.link_points[link] = torch.tensor(
+                pts, dtype=torch.float32, device=device
+            )
+
+    def _transform_points(self, points, transform):
+
+        ones = torch.ones(len(points), 1, device=self.device)
+
+        points_h = torch.cat([points, ones], dim=1)
+
+        return (points_h @ transform.T)[:, :3]
+
+
+    def compose_joint_vector(self, q_data):
+
+        q_data = np.asarray(q_data, dtype=np.float32).reshape(-1)
+
+        if q_data.shape[0] < ARM_AND_GRIPPER_DOF:
+            raise ValueError(
+                f"q_data must contain at least {ARM_AND_GRIPPER_DOF} values, got {q_data.shape[0]}"
+            )
+
+        q_data = q_data[:ARM_AND_GRIPPER_DOF]
+
+        full_q = np.zeros(self.robot.n_joints, dtype=np.float32)
+
+        # -------- 机械臂7关节 --------
+        arm_joint_map = {
+            "joint_right_1": q_data[0],
+            "joint_right_2": q_data[1],
+            "joint_right_3": q_data[2],
+            "joint_right_4": q_data[3],
+            "joint_right_5": q_data[4],
+            "joint_right_6": q_data[5],
+            "joint_right_7": q_data[6],
+        }
+
+        # -------- gripper --------
+        gripper_state = float(np.clip(q_data[7], 0.0, 1.0))
+        finger_angle = -FINGER_OPEN_ANGLE * gripper_state
+
+        finger_joint_map = {
+            "Left_1_Joint2": finger_angle,
+            "Left_Support_Joint2": -finger_angle,
+            "Left_2_Joint2": finger_angle,
+            "Right_2_Joint2": -finger_angle,
+            "Right_1_Joint2": -finger_angle,
+            "Right_Support_Joint2": -finger_angle,
+        }
+
+        # -------- 合并所有joint --------
+        joint_map = {**arm_joint_map, **finger_joint_map}
+
+        # -------- 填充full_q --------
+        for index, joint_name in enumerate(self.joint_names):
+            if joint_name in joint_map:
+                full_q[index] = joint_map[joint_name]
+
+        return torch.tensor(full_q, dtype=torch.float32, device=self.device)
+
+
+    def forward_kinematics(self, q):
+
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+
+        q = q.to(self.device)
+
+        fk = self.robot.forward_kinematics(q)
+
+        all_points = []
+
+        for link_name, pts in self.link_points.items():
+
+            T = fk[link_name].get_matrix()[0]
+
+            pts_world = self._transform_points(pts, T)
+
+            all_points.append(pts_world)
+
+        all_points = torch.cat(all_points, dim=0)
+
+        return all_points
+
+
+class VisualizeCloud:
+
+    def __init__(self,
+                 blosc_path,
+                 gripper_model,
+                 camera_name="cam_right_depth",
+                 num_points=1024):
+
+        self.blosc_path = blosc_path
+        self.camera_name = camera_name
+        self.num_points = num_points
+        self.gripper = gripper_model
+
+        self.cam_params = {
+
+            "cam_head_depth": {
+                "fx": 393.23,
+                "fy": 393.23,
+                "cx": 317.85,
+                "cy": 243.23,
+                "scale": 0.001
+            },
+
+            "cam_right_depth": {
+                "fx": 389.05,
+                "fy": 389.05,
+                "cx": 314.73,
+                "cy": 236.93,
+                "scale": 0.001
+            }
+        }
+
+        cam = self.cam_params[camera_name]
+
+        self.fx = cam["fx"]
+        self.fy = cam["fy"]
+        self.cx = cam["cx"]
+        self.cy = cam["cy"]
+        self.scale = cam["scale"]
+
+        self.obs, self.action, self.timestamps = self.load_blosc_file(blosc_path)
+
+        self.q = self.extract_q(self.obs)
+
+        self.num_frames = len(self.obs)
+
+        print("Total frames:", self.num_frames)
+
+        self.current_frame = 0
+
+    # BL osc loader
+
+    def unpack_one(self, raw, offset):
+
+        nbytes, cbytes, blocksize = blosc.get_cbuffer_sizes(raw[offset:])
+
+        buf = raw[offset: offset + cbytes]
+
+        arr = blosc.unpack_array(buf)
+
+        return arr, offset + cbytes
+
+
+    def load_blosc_file(self, path):
+
+        with open(path, "rb") as f:
+            raw = f.read()
+
+        offset = 0
+
+        obs, offset = self.unpack_one(raw, offset)
+        action, offset = self.unpack_one(raw, offset)
+        timestamps, offset = self.unpack_one(raw, offset)
+
+        return obs, action, timestamps
+
+
+    def extract_q(self, obs):
+
+        q_list = []
+
+        for sample in obs:
+
+            if "q" in sample:
+
+                q = np.asarray(sample["q"][:ARM_AND_GRIPPER_DOF], dtype=np.float32)
+
+                q_list.append(q)
+
+        q_array = np.array(q_list)
+
+        # print("q:", q_array)
+
+        return q_array
+    
+    def transform_cloud(self, cloud, T):
+
+        ones = np.ones((cloud.shape[0], 1))
+
+        cloud_h = np.concatenate([cloud, ones], axis=1)
+
+        cloud_trans = (T @ cloud_h.T).T[:, :3]
+
+        return cloud_trans
+
+    def depth_to_cloud(self, depth):
+
+        depth = depth.astype(np.float32) * self.scale
+
+        H, W = depth.shape
+
+        u = np.arange(W)
+        v = np.arange(H)
+
+        u, v = np.meshgrid(u, v)
+
+        Z = depth
+
+        X = (u - self.cx) * Z / self.fx
+        Y = (v - self.cy) * Z / self.fy
+
+        cloud = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+
+        mask = np.isfinite(cloud).all(axis=1) & (cloud[:, 2] > 0)
+
+        return cloud[mask]
+
+
+    def farthest_point_sampling(self, points, num_points=1024, use_cuda=True):
+
+        """
+        points: numpy array (N, 3)
+        return:
+            sampled_points: (num_points, 3)
+            indices: (num_points,)
+        """
+
+        device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+
+        pts = torch.from_numpy(points).float().to(device)   # (N, 3)
+        N = pts.shape[0]
+
+        # 存储采样索引
+        indices = torch.zeros(num_points, dtype=torch.long, device=device)
+
+        # 存储每个点到当前已选点集的最小距离
+        distances = torch.ones(N, device=device) * 1e10
+
+        # 随机选择第一个点
+        farthest = torch.randint(0, N, (1,), device=device)
+
+        for i in range(num_points):
+            indices[i] = farthest
+            centroid = pts[farthest, :].view(1, 3)
+
+            # 计算到新加入点的距离
+            dist = torch.sum((pts - centroid) ** 2, dim=1)
+
+            # 更新最小距离
+            mask = dist < distances
+            distances[mask] = dist[mask]
+
+            # 选择最远点
+            farthest = torch.argmax(distances)
+
+        sampled_points = pts[indices]
+
+        return sampled_points.cpu().numpy(), indices.cpu().numpy()
+
+
+    def preprocess_point_cloud(self, points, num_points=1024, use_cuda=True):
+
+        WORK_SPACE = [
+            [-0.6, 1.3],   # X
+            [-0.3, 0.5],   # Y
+            [0.2, 1.8]     # Z
+        ]
+
+        # 只保留工作空间内的点
+        mask = (
+            (points[:, 0] > WORK_SPACE[0][0]) & (points[:, 0] < WORK_SPACE[0][1]) &
+            (points[:, 1] > WORK_SPACE[1][0]) & (points[:, 1] < WORK_SPACE[1][1]) &
+            (points[:, 2] > WORK_SPACE[2][0]) & (points[:, 2] < WORK_SPACE[2][1])
+        )
+        points = points[mask]
+
+        if len(points) == 0:
+            return np.zeros((num_points, 3), dtype=np.float32)
+
+        points_xyz = points[:, :3]
+
+        points_xyz, _ = self.farthest_point_sampling(points_xyz, num_points=num_points, use_cuda=use_cuda)
+
+        return points_xyz
+
+
+    def get_frame_clouds(self, frame_id):
+
+        sample = self.obs[frame_id]
+
+        depth = np.squeeze(sample[self.camera_name])
+
+        cloud_cam = self.preprocess_point_cloud(
+            self.depth_to_cloud(depth),
+            num_points=self.num_points
+        )
+
+        q_data = self.q[frame_id]
+
+        # head camera
+
+        if self.camera_name == "cam_head_depth":
+
+            return cloud_cam, q_data
+        # right camera
+
+        q = self.gripper.compose_joint_vector(q_data)
+
+        cloud_hand = self.gripper.forward_kinematics(q)
+
+        cloud_hand = cloud_hand.detach().cpu().numpy()
+
+        # base → camera
+
+        cloud_hand = self.transform_cloud(
+                cloud_hand,
+                RIGHT_CAM_EXTRINSIC
+            )
+
+        merged_cloud = np.concatenate([cloud_cam, cloud_hand], axis=0)
+
+        return merged_cloud, q_data
+
+    def update_frame(self, frame_id):
+
+        frame_id = max(0, min(frame_id, self.num_frames - 1))
+
+        self.current_frame = frame_id
+
+        cloud, q_data = self.get_frame_clouds(frame_id)
+
+        self.pcd.points = o3d.utility.Vector3dVector(
+            cloud.astype(np.float64)
+        )
+
+        self.vis.update_geometry(self.pcd)
+
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+
+    def visualize(self):
+
+        cloud, _ = self.get_frame_clouds(0)
+
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+
+        self.vis.create_window("PointCloud Viewer", 1200, 900)
+
+        self.pcd = o3d.geometry.PointCloud()
+
+        self.pcd.points = o3d.utility.Vector3dVector(
+            cloud.astype(np.float64)
+        )
+
+        self.pcd.paint_uniform_color([1, 0, 0])
+
+        self.vis.add_geometry(self.pcd)
+
+        render_option = self.vis.get_render_option()
+        render_option.point_size = 2.0
+        render_option.background_color = np.array([0,0,0])
+
+        self.vis.register_key_callback(ord("N"), self.next_frame)
+        self.vis.register_key_callback(ord("B"), self.prev_frame)
+
+        self.update_frame(0)
+
+        self.vis.run()
+
+        self.vis.destroy_window()
+
+    def next_frame(self, vis):
+
+        self.update_frame(self.current_frame + 1)
+
+        return False
+
+
+    def prev_frame(self, vis):
+
+        self.update_frame(self.current_frame - 1)
+
+        return False
+
+
+    def quit_vis(self, vis):
+
+        vis.close()
+
+        return False
+
+
+
+
+BLOSC_PATH = "dataset/demo0000.blosc"
+
+URDF_PATH = r"D:\texttwo\realman_data_collection\grasp_point_model\Embodied lifting robot_two wheels_RM75-B-V\urdf\robot_hand.urdf"
+
+MESH_ROOT = r"D:\texttwo\realman_data_collection\grasp_point_model\Embodied lifting robot_two wheels_RM75-B-V\meshes"
+
+GRIPPER_LINKS = [
+    "hand_base2",
+    "Left_1_Link2",
+    "Left_Support_Link2",
+    "Left_2_Link2",
+    "Right_2_Link2",
+    "Right_1_Link2",
+    "Right_Support_Link2"
 ]
 
-def depth_to_cloud(depth):
-    depth = depth.astype(np.float32) * scale
-    H, W = depth.shape
-    u = np.arange(W)
-    v = np.arange(H)
-    u, v = np.meshgrid(u, v)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    Z = depth
-    X = (u - cx) * Z / fx
-    Y = (v - cy) * Z / fy
+gripper = GripperModel(
+    URDF_PATH,
+    MESH_ROOT,
+    GRIPPER_LINKS,
+    device=device
+)
 
-    cloud = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)
-    mask = np.isfinite(cloud).all(axis=1) & (cloud[:, 2] > 0)
-    cloud = cloud[mask]
-    return cloud
+viewer = VisualizeCloud(
+    BLOSC_PATH,
+    gripper,
+    camera_name="cam_right_depth"   #cam_right_depth,cam_head_depth
+)
 
-
-def farthest_point_sampling(points, num_points=1024, use_cuda=True):
-    """
-    points: numpy array (N, 3)
-    return:
-        sampled_points: (num_points, 3)
-        indices: (num_points,)
-    """
-
-    device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
-
-    pts = torch.from_numpy(points).float().to(device)   # (N, 3)
-    N = pts.shape[0]
-
-    # 存储采样索引
-    indices = torch.zeros(num_points, dtype=torch.long, device=device)
-
-    # 存储每个点到当前已选点集的最小距离
-    distances = torch.ones(N, device=device) * 1e10
-
-    # 随机选择第一个点
-    farthest = torch.randint(0, N, (1,), device=device)
-    
-    for i in range(num_points):
-        indices[i] = farthest
-        centroid = pts[farthest, :].view(1, 3)
-
-        # 计算到新加入点的距离
-        dist = torch.sum((pts - centroid) ** 2, dim=1)
-
-        # 更新最小距离
-        mask = dist < distances
-        distances[mask] = dist[mask]
-
-        # 选择最远点
-        farthest = torch.argmax(distances)
-
-    sampled_points = pts[indices]
-
-    return sampled_points.cpu().numpy(), indices.cpu().numpy()
-
-def preprocess_point_cloud(points, num_points=1024):
-    mask = (
-        (points[:, 0] > WORK_SPACE[0][0]) & (points[:, 0] < WORK_SPACE[0][1]) &
-        (points[:, 1] > WORK_SPACE[1][0]) & (points[:, 1] < WORK_SPACE[1][1]) &
-        (points[:, 2] > WORK_SPACE[2][0]) & (points[:, 2] < WORK_SPACE[2][1])
-    )
-    points_crop = points[mask]
-    if len(points_crop) == 0:
-        print("failed to crop point cloud")
-        return np.zeros((num_points, 3), dtype=np.float32)
-        
-    return farthest_point_sampling(points_crop, num_points=num_points, use_cuda=True)
-
-# 4️⃣ Open3D 可视化器
-current_frame = 0
-
-vis = o3d.visualization.VisualizerWithKeyCallback()
-vis.create_window(window_name="Cloud Viewer", width=1200, height=900)
-
-pcd_raw = o3d.geometry.PointCloud()
-pcd_crop = o3d.geometry.PointCloud()
-
-pcd_raw.paint_uniform_color([0.5, 0.5, 0.5])    # 灰色
-pcd_crop.paint_uniform_color([1.0, 0, 0])       # 红色
-
-vis.add_geometry(pcd_raw)
-vis.add_geometry(pcd_crop)
-
-render_option = vis.get_render_option()
-render_option.point_size = 2.0
-render_option.background_color = np.array([0, 0, 0])
-render_option.light_on = True
-
-# 5️⃣ 更新函数
-def update_frame(frame_id):
-    global current_frame
-    frame_id = max(0, min(frame_id, num_frames - 1))
-    current_frame = frame_id
-
-    print("\n========== Frame:", current_frame, "==========")
-    sample = obs[current_frame]
-    # depth = np.squeeze(sample["cam_head_depth"])  # 640×480
-    depth = np.squeeze(sample["cam_right_depth"])  # 640×480
-
-    cloud_raw = depth_to_cloud(depth)
-    cloud_crop,_ = preprocess_point_cloud(cloud_raw, num_points=1024)
-
-    # print("Raw cloud shape:", cloud_raw)
-    # print("Crop cloud shape:", cloud_crop.shape)
-
-    cloud_crop = cloud_crop.astype(np.float64) 
-
-    # pcd_raw.points = o3d.utility.Vector3dVector(cloud_raw.astype(np.float64))
-    pcd_crop.points = o3d.utility.Vector3dVector(cloud_crop)
-
-    # pcd_raw.points = o3d.utility.Vector3dVector(cloud_raw)
-    pcd_crop.points = o3d.utility.Vector3dVector(cloud_crop)
-
-    # vis.update_geometry(pcd_raw)
-    vis.update_geometry(pcd_crop)
-
-    if frame_id == 0:
-        vis.reset_view_point(True)
-
-    vis.poll_events()
-    vis.update_renderer()
-
-# 6️⃣ 键盘控制
-def next_frame(vis):
-    update_frame(current_frame + 1)
-    return False
-
-def prev_frame(vis):
-    update_frame(current_frame - 1)
-    return False
-
-def quit_vis(vis):
-    vis.close()
-    return False
-
-vis.register_key_callback(ord("N"), next_frame)
-vis.register_key_callback(ord("B"), prev_frame)
-vis.register_key_callback(ord("Q"), quit_vis)
-
-# 初始化
-update_frame(0)
-
-vis.run()
-vis.destroy_window()
+viewer.visualize()

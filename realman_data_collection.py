@@ -59,6 +59,8 @@ class RobotArm:
         self.l_handle = self.l_robot.rm_create_robot_arm("169.254.128.18", 8080)
         self.r_handle = self.r_robot.rm_create_robot_arm("169.254.128.19", 8080)
 
+        # self.set_r_joints_angles( [-162.3698, -119.6334,  155.1919,  -88.6483,   39.4240,  108.4789, -97.4292],10,0,0,1) #初始位置，前提是要将臂先抬起来
+
 
     def get_l_gripper_state(self):
         state = self.l_robot.rm_get_rm_plus_state_info()
@@ -124,15 +126,10 @@ class ArmStateRecorder(threading.Thread):
         self.prev_joint = None
         while self.running:
             ts = time.time()
-            # q = self.arm.get_joint_positions()
-
             joint = self.arm.get_r_robot_joints()
             for i in range(len(joint)):
                 joint[i] = joint[i] / 180.0 * np.pi  # deg -> rad
             
-            # pos = self.arm.get_r_robot_pose()[:3]
-            # orn = self.arm.get_r_robot_pose()[3:] #应该是欧拉角，可以打印一下，欧拉角的顺序是xyz吗，存疑
-            # gripper = [self.arm.get_r_gripper_state()/1000.0]
 
             # 将列表转换为 numpy 数组
             joint = np.array(joint, dtype=np.float32)
@@ -268,6 +265,11 @@ class MultiCameraDatasetBuilder:
             cam_data[f"{cid}_depth"] = np.array(depths) # (T, H, W)
 
         current_obs = {'q': q, **cam_data}
+
+         # 清空所有数据
+        if self.shared_buffer.ptr == 0:
+            self.prev_obs = None
+
         if self.prev_obs is None:
             self.prev_obs = current_obs
             return
@@ -281,15 +283,9 @@ class MultiCameraDatasetBuilder:
         # 更新缓存
         self.prev_obs = current_obs
 
-        # obs = {'q': q, **cam_data}
-        # action = self.prev_q
-        # self.shared_buffer.add(obs, action, last_timestamp)
-        # self.prev_q = q
-
 
 t = 0
-def save_and_clear(shared_buffer, save_dir="dataset"):
-
+def save_and_clear(shared_buffer, save_dir="init_rectangle_xxx"):#视角/形状/物体名称
 
     global t
     os.makedirs(save_dir, exist_ok=True)
@@ -368,7 +364,7 @@ def main():
 
             if collecting:
                 builder.step()
-            time.sleep(0.1)
+            time.sleep(0.1) #总采集数据频率
 
     except KeyboardInterrupt:
         pass
