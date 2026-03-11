@@ -69,10 +69,10 @@ import h5py
 import numpy as np
 
 # 文件路径
-hdf5_file_path = "weita_5hz_dataset\\weita_5hz_fix_dataset.hdf5"
+hdf5_file_path = "init_rectangle_pink_weita\\init_rectangle_pink_weita_dataset.hdf5"
 
 # 指定 demo
-demo_name = "demo_12"
+demo_name = "demo_0"
 
 if __name__ == "__main__":
     with h5py.File(hdf5_file_path, "r") as f:

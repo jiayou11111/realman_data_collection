@@ -157,8 +157,8 @@ def convert_dataset(blosc_dir, hdf5_path):
 # -----------------------------
 if __name__ == "__main__":
 
-    BLOSC_DIR = r"weita_5hz_dataset"
-    HDF5_FILE = r"weita_5hz_dataset/weita_5hz_fix_dataset.hdf5"
+    BLOSC_DIR = r"init_rectangle_pink_weita"
+    HDF5_FILE = r"init_rectangle_pink_weita/init_rectangle_pink_weita_dataset.hdf5"
 
     convert_dataset(
         blosc_dir=BLOSC_DIR,

@@ -70,15 +70,36 @@ def visualize_one_sample(obs, idx=0):
             continue
 
         img = v[-1]
-        if img.dtype != np.uint8:
-            img = img.astype(np.uint8)
 
-        cv2.imshow(k, img)
+        # ===== depth 图 =====
+        if "depth" in k:
+            depth = img.astype(np.float32)
+
+            depth_norm = cv2.normalize(
+                depth,
+                None,
+                0,
+                255,
+                cv2.NORM_MINMAX
+            ).astype(np.uint8)
+
+            cv2.imshow(k, depth_norm)
+
+        # ===== RGB 图 =====
+        else:
+            rgb = img
+
+            if rgb.dtype != np.uint8:
+                rgb = rgb.astype(np.uint8)
+
+            # OpenCV 显示需要 BGR
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+            cv2.imshow(k, bgr)
 
     print("Press any key to close windows...")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
 

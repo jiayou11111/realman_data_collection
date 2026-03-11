@@ -267,8 +267,8 @@ class MultiCameraDatasetBuilder:
         current_obs = {'q': q, **cam_data}
 
          # 清空所有数据
-        if self.shared_buffer.ptr == 0:
-            self.prev_obs = None
+        # if self.shared_buffer.ptr == 0:
+        #     self.prev_obs = None
 
         if self.prev_obs is None:
             self.prev_obs = current_obs
@@ -285,7 +285,7 @@ class MultiCameraDatasetBuilder:
 
 
 t = 0
-def save_and_clear(shared_buffer, save_dir="init_rectangle_xxx"):#视角/形状/物体名称
+def save_and_clear(shared_buffer, builder, save_dir="init_rectangle_pink_weita"):#视角/形状/颜色/物体名称
 
     global t
     os.makedirs(save_dir, exist_ok=True)
@@ -307,6 +307,8 @@ def save_and_clear(shared_buffer, save_dir="init_rectangle_xxx"):#视角/形状/
     print(f"[✓] Saved {size} samples -> {path}  ({os.path.getsize(path)>>20} MB)")
     t += 1
     shared_buffer.clear()
+    # 清空 builder 的历史状态
+    builder.prev_obs = None
 
 
 def main():
@@ -330,7 +332,7 @@ def main():
     cam_buffers = {}
     for cam in CAMERAS:
 
-        cam_buf =  RealSenseCameraBuffer(maxlen=150)
+        cam_buf =  RealSenseCameraBuffer(maxlen=200)
 
         client = CameraSocket(cam,cam_buf)
     
@@ -358,7 +360,7 @@ def main():
                 
             if key == 'c':
                 collecting = False
-                save_and_clear(shared_buffer)
+                save_and_clear(shared_buffer, builder)
                 print("[■] Stopped")
                 time.sleep(0.5)
 

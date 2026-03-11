@@ -66,6 +66,8 @@ class CameraSocket(threading.Thread):
             np.frombuffer(rgb_bytes, np.uint8),
             cv2.IMREAD_COLOR
         )
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+
         depth = cv2.imdecode(
             np.frombuffer(depth_bytes, np.uint8),
             cv2.IMREAD_UNCHANGED
@@ -78,7 +80,10 @@ class CameraSocket(threading.Thread):
 
         while True:
             ts, img ,depth = self._recv_one_frame()
-            cv2.imshow(f"{self.name}_RGB", img)
+            # OpenCV显示需要BGR
+            img_show = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            cv2.imshow(f"{self.name}_RGB", img_show)
             cv2.waitKey(1)
             # print("img_success")
             self.deque.append((ts, img, depth))
