@@ -10,10 +10,8 @@ import h5py
 import numpy as np
 import cv2
 
-
-# -----------------------------
 # blosc 读取
-# -----------------------------
+
 def unpack_one(raw, offset):
     nbytes, cbytes, blocksize = blosc.get_cbuffer_sizes(raw[offset:])
     buf = raw[offset: offset + cbytes]
@@ -53,14 +51,14 @@ def write_one_demo(h5file, demo_name, obs, actions):
         # right camera
         img_right = o["cam_right_rgb"][-1]  # (H, W, 3)
         img_right = cv2.resize(
-            img_right, (84, 84), interpolation=cv2.INTER_AREA
+            img_right, (320, 240), interpolation=cv2.INTER_AREA
         )
         agentview_images.append(img_right)
 
         # head camera
-        img_head = o["cam_head_rgb"][-1]    # (H, W, 3)
+        img_head = o["cam_head_rgb"][-1]    # (H, W, 3),  注意通道dp(H,W,3)
         img_head = cv2.resize(
-            img_head, (84, 84), interpolation=cv2.INTER_AREA
+            img_head, (320, 240), interpolation=cv2.INTER_AREA
         )
         agentview_head_images.append(img_head)
 
@@ -152,13 +150,11 @@ def convert_dataset(blosc_dir, hdf5_path):
     print(f"[OK] All demos saved into {hdf5_path}")
 
 
-# -----------------------------
 # main
-# -----------------------------
 if __name__ == "__main__":
 
-    BLOSC_DIR = r"init_rectangle_pink_weita"
-    HDF5_FILE = r"init_rectangle_pink_weita/init_rectangle_pink_weita_dataset.hdf5"
+    BLOSC_DIR = r"black_weita_delete0data_BGR_5hz"
+    HDF5_FILE = r"black_weita_delete0data_BGR_5hz/black_weita_delete0data_BGR_240320_5hz.hdf5"
 
     convert_dataset(
         blosc_dir=BLOSC_DIR,
