@@ -103,7 +103,7 @@ def visualize_one_sample(obs, idx=0):
 
 if __name__ == "__main__":
 
-    BLOSC_FILE = r"dataset\demo0011.blosc"
+    BLOSC_FILE = r"dataset\demo0005.blosc"
 
     if not os.path.exists(BLOSC_FILE):
         raise FileNotFoundError(BLOSC_FILE)
@@ -117,4 +117,4 @@ if __name__ == "__main__":
     print_all_q_action(obs, action, timestamps)
 
     # 4️⃣ 显示第 0 帧的相机画面
-    visualize_one_sample(obs, idx=0)
+    visualize_one_sample(obs, idx=5)

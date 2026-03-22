@@ -545,7 +545,7 @@
     type="fixed">
     <origin
       xyz="0 0 0.0228"
-      rpy="0 0 0" />
+      rpy="0 0 -1.57" />
     <parent
       link="link_right_7" />
     <child

@@ -135,7 +135,7 @@ class ArmStateRecorder(threading.Thread):
             joint = np.array(joint, dtype=np.float32)
             
             pos = np.array(self.arm.get_r_robot_pose()[:3], dtype=np.float32)
-            orn = np.array(self.arm.get_r_robot_pose()[3:], dtype=np.float32) #应该是欧拉角，可以打印一下，欧拉角的顺序是xyz吗，存疑
+            orn = np.array(self.arm.get_r_robot_pose()[3:], dtype=np.float32) 
             gripper = np.array([self.arm.get_r_gripper_state()/1000.0], dtype=np.float32)
 
             # 计算 Δjoint
@@ -285,7 +285,7 @@ class MultiCameraDatasetBuilder:
 
 
 t = 0
-def save_and_clear(shared_buffer, builder, save_dir="init_rectangle_pink_weita"):#视角/形状/颜色/物体名称
+def save_and_clear(shared_buffer, builder, save_dir="init_rectangle_blue_weita"):#视角/形状/颜色/物体名称
 
     global t
     os.makedirs(save_dir, exist_ok=True)

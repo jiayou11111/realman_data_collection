@@ -8,20 +8,19 @@ import torch
 import pytorch_kinematics as pk
 import trimesh as tm
 import os
-
+from scipy.spatial.transform import Rotation as R
 
 ARM_AND_GRIPPER_DOF = 8
 FINGER_OPEN_ANGLE = 0.91
 
-
 #外参待修改
+# 相机相对于末端坐标系
 RIGHT_CAM_EXTRINSIC = np.array([
-    [1, 0, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, 0],
+    [-0.04168939, 0.99735439, -0.05955013, -0.09113213],
+    [-0.9989049, -0.04033902, -0.02370156, 0.03494395],
+    [-0.02123666, -0.06047302, -0.9979439, 0.01531916],
     [0, 0, 0, 1]
 ], dtype=np.float32)
-
 
 
 # Gripper Model
@@ -29,7 +28,7 @@ RIGHT_CAM_EXTRINSIC = np.array([
 class GripperModel:
 
     def __init__(self, urdf_path, mesh_root, gripper_links,
-                 device="cuda", sample_points=512):
+                 device="cuda", sample_points=64):
 
         self.device = device
         self.gripper_links = gripper_links
@@ -95,6 +94,7 @@ class GripperModel:
 
         # -------- gripper --------
         gripper_state = float(np.clip(q_data[7], 0.0, 1.0))
+        gripper_state = 1.0 - gripper_state  # 0: open, 1: close
         finger_angle = -FINGER_OPEN_ANGLE * gripper_state
 
         finger_joint_map = {
@@ -126,6 +126,12 @@ class GripperModel:
 
         fk = self.robot.forward_kinematics(q)
 
+        # print("\n正在查询 link_right_7 的坐标变换...")
+        # # 获取 link_right_7 的变换
+        self.transform_right_7 = fk["link_right_7"]
+        
+        # print("link_right_7 变换矩阵", self.transform_right_7)
+
         all_points = []
 
         for link_name, pts in self.link_points.items():
@@ -135,10 +141,9 @@ class GripperModel:
             pts_world = self._transform_points(pts, T)
 
             all_points.append(pts_world)
+            # print("link:", link_name)
 
-        all_points = torch.cat(all_points, dim=0)
-
-        return all_points
+        return torch.cat(all_points, dim=0)
 
 
 class VisualizeCloud:
@@ -147,7 +152,7 @@ class VisualizeCloud:
                  blosc_path,
                  gripper_model,
                  camera_name="cam_right_depth",
-                 num_points=1024):
+                 num_points=1600):
 
         self.blosc_path = blosc_path
         self.camera_name = camera_name
@@ -184,6 +189,8 @@ class VisualizeCloud:
         self.obs, self.action, self.timestamps = self.load_blosc_file(blosc_path)
 
         self.q = self.extract_q(self.obs)
+        self.ee_pose = self.extract_ee_pose(self.obs)
+        # print("ee_pose:", self.ee_pose)
 
         self.num_frames = len(self.obs)
 
@@ -235,7 +242,25 @@ class VisualizeCloud:
         # print("q:", q_array)
 
         return q_array
-    
+
+    def extract_ee_pose(self, obs):
+
+        pose_list = []
+
+        for sample in obs:
+
+            if "q" in sample:
+
+                q = np.asarray(sample["q"], dtype=np.float32)
+
+                ee_pose = q[-6:]   # 取最后6维
+
+                pose_list.append(ee_pose)
+
+        pose_array = np.array(pose_list)
+
+        return pose_array
+        
     def transform_cloud(self, cloud, T):
 
         ones = np.ones((cloud.shape[0], 1))
@@ -245,6 +270,43 @@ class VisualizeCloud:
         cloud_trans = (T @ cloud_h.T).T[:, :3]
 
         return cloud_trans
+
+    def pose_to_matrix(self, pose):
+        """
+        pose: [x, y, z, rx, ry, rz]
+        rx ry rz: rad
+        """
+        x, y, z, rx, ry, rz = pose
+
+        cx, cy, cz = np.cos([rx, ry, rz])
+        sx, sy, sz = np.sin([rx, ry, rz])
+
+        # Rz Ry Rx
+        Rz = np.array([
+            [cz, -sz, 0],
+            [sz, cz, 0],
+            [0, 0, 1]
+        ])
+
+        Ry = np.array([
+            [cy, 0, sy],
+            [0, 1, 0],
+            [-sy, 0, cy]
+        ])
+
+        Rx = np.array([
+            [1, 0, 0],
+            [0, cx, -sx],
+            [0, sx, cx]
+        ])
+
+        R = Rz @ Ry @ Rx
+
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [x, y, z]
+
+        return T
 
     def depth_to_cloud(self, depth):
 
@@ -269,7 +331,7 @@ class VisualizeCloud:
         return cloud[mask]
 
 
-    def farthest_point_sampling(self, points, num_points=1024, use_cuda=True):
+    def farthest_point_sampling(self, points, num_points=1600, use_cuda=True):
 
         """
         points: numpy array (N, 3)
@@ -311,7 +373,7 @@ class VisualizeCloud:
         return sampled_points.cpu().numpy(), indices.cpu().numpy()
 
 
-    def preprocess_point_cloud(self, points, num_points=1024, use_cuda=True):
+    def preprocess_point_cloud(self, points, num_points=1600, use_cuda=True):
 
         WORK_SPACE = [
             [-0.6, 1.3],   # X
@@ -349,6 +411,7 @@ class VisualizeCloud:
         )
 
         q_data = self.q[frame_id]
+        # print("q_data:", q_data)
 
         # head camera
 
@@ -363,15 +426,86 @@ class VisualizeCloud:
 
         cloud_hand = cloud_hand.detach().cpu().numpy()
 
-        # base → camera
 
-        cloud_hand = self.transform_cloud(
-                cloud_hand,
-                RIGHT_CAM_EXTRINSIC
-            )
+        # 正确的误解（待解决）
+        # # 1 读取末端位姿
+        # ee_pose = self.ee_pose[frame_id] # x,y,z,rx,ry,rz
 
-        merged_cloud = np.concatenate([cloud_cam, cloud_hand], axis=0)
+        # print("末端位姿:", ee_pose)
 
+        # # # 构造变换矩阵 
+        # T_ee_cam = RIGHT_CAM_EXTRINSIC
+
+        # cloud_cam = self.transform_cloud(
+        #     cloud_cam,
+        #     T_ee_cam
+        # )
+        # # 构造绕 EE z 轴旋转 180°
+        # T_rot = np.eye(4)
+        # T_rot[:3, :3] = np.array([
+        #     [1,  0, 0],
+        #     [ 0, 1, 0],
+        #     [ 0, 0, -1]
+        # ])
+
+        # # 再做一次变换
+        # cloud_cam = self.transform_cloud(
+        #     cloud_cam,
+        #     T_rot
+        # )
+
+        # T_world_ee = self.pose_to_matrix(ee_pose)
+
+        # T_base_world = [[ 0.69367913 ,0, -0.71986322,  0],
+        # [0,  1, 0 ,0],
+        # [ 0.7192272  , 0 , 0.69410756 , 0],
+        # [ 0.       ,   0.        ,  0.         , 1.        ]]
+
+        # T_base_cam = T_base_world @T_world_ee
+
+        # cloud_cam = self.transform_cloud(
+        #     cloud_cam,
+        #     T_base_cam
+        # )
+        # merged_cloud = np.concatenate([cloud_cam, cloud_hand], axis=0)
+
+
+
+        # 存疑answer
+        tf = self.gripper.transform_right_7
+
+        # # ✅ 正确获取4x4矩阵
+        T = tf.get_matrix().cpu().numpy()[0]
+
+        T_base_ee = T
+
+        # 2 hand-eye
+        T_ee_cam = RIGHT_CAM_EXTRINSIC
+
+        cloud_cam = self.transform_cloud(
+            cloud_cam,
+            T_ee_cam
+        )
+        # 疑惑
+        T_rot = np.eye(4)
+        T_rot[:3, :3] = np.array([
+            [1,  0, 0],
+            [ 0, 1, 0],
+            [ 0, 0, -1]
+        ])
+
+        # 再做一次变换
+        cloud_ee_rot = self.transform_cloud(
+            cloud_cam,
+            T_rot
+        )
+
+        cloud_ee_rot = self.transform_cloud(
+            cloud_ee_rot,
+            T_base_ee
+        )
+
+        merged_cloud = np.concatenate([cloud_ee_rot, cloud_hand], axis=0)
         return merged_cloud, q_data
 
     def update_frame(self, frame_id):
@@ -445,8 +579,7 @@ class VisualizeCloud:
 
 
 
-
-BLOSC_PATH = "dataset/demo0000.blosc"
+BLOSC_PATH = "dataset/demo0004.blosc"
 
 URDF_PATH = r"D:\texttwo\realman_data_collection\grasp_point_model\Embodied lifting robot_two wheels_RM75-B-V\urdf\robot_hand.urdf"
 
@@ -468,13 +601,15 @@ gripper = GripperModel(
     URDF_PATH,
     MESH_ROOT,
     GRIPPER_LINKS,
-    device=device
+    device=device,
+    sample_points=64
 )
 
 viewer = VisualizeCloud(
     BLOSC_PATH,
     gripper,
-    camera_name="cam_right_depth"   #cam_right_depth,cam_head_depth
+    camera_name="cam_right_depth" ,  #cam_right_depth,cam_head_depth
+    num_points=1600
 )
 
 viewer.visualize()
